@@ -157,13 +157,13 @@ public class KopruEngine {
                 throw new IOException("zaman asimi");
             }
             remote.EndConnect(ar);
-            remote.ReceiveTimeout = 0;
-            remote.SendTimeout = 0;
+            remote.ReceiveTimeout = -1;
+            remote.SendTimeout = -1;
 
             stream.Write(new byte[] { 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 }, 0, 10);
             replied = true;
-            client.ReceiveTimeout = 0;
-            client.SendTimeout = 0;
+            client.ReceiveTimeout = -1;
+            client.SendTimeout = -1;
             Pump(client, remote, stream, remote.GetStream(), port);
         } catch (Exception ex) {
             KopruLog.Write("hata " + hostLabel + " — " + ex.Message);
@@ -244,7 +244,7 @@ public class KopruEngine {
         } catch (Exception) {
             if (ms.Length == 0) throw;
         } finally {
-            s.ReadTimeout = 0;
+            s.ReadTimeout = -1;
         }
         return ms.ToArray();
     }
