@@ -70,7 +70,7 @@ public class KopruEngine {
             Thread t = new Thread(new ThreadStart(AcceptLoop));
             t.IsBackground = true;
             t.Start();
-            KopruLog.Write("dinleniyor 127.0.0.1:" + Port);
+        KopruLog.Write("dinleniyor 127.0.0.1:" + Port + " (SOCKS5 + HTTP)");
             return null;
         } catch (Exception ex) {
             Listening = false;
@@ -95,6 +95,28 @@ public class KopruEngine {
         }
     }
 
+    [System.Runtime.InteropServices.DllImport("wininet.dll", SetLastError = true)]
+    static extern bool InternetSetOption(System.IntPtr hInternet, int dwOption, System.IntPtr lpBuffer, int dwBufferLength);
+
+    public static void RefreshWinInet() {
+        try {
+            InternetSetOption(System.IntPtr.Zero, 39, System.IntPtr.Zero, 0);
+            InternetSetOption(System.IntPtr.Zero, 37, System.IntPtr.Zero, 0);
+        } catch { }
+    }
+
+    static void Infinite(Socket sock) {
+        try {
+            sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveTimeout, 0);
+            sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendTimeout, 0);
+        } catch {
+            try {
+                sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveTimeout, 300000);
+                sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendTimeout, 300000);
+            } catch { }
+        }
+    }
+
     void Handle(object state) {
         TcpClient client = (TcpClient)state;
         Interlocked.Increment(ref _active);
@@ -102,43 +124,17 @@ public class KopruEngine {
         bool replied = false;
         try {
             client.NoDelay = true;
-            client.ReceiveTimeout = 15000;
-            client.SendTimeout = 15000;
             NetworkStream stream = client.GetStream();
-            int ver = stream.ReadByte();
-            int nmet = stream.ReadByte();
-            if (ver != 5 || nmet < 1) return;
-            byte[] mets = ReadExact(stream, nmet);
-            stream.Write(new byte[] { 5, 0 }, 0, 2);
-
-            byte[] head = ReadExact(stream, 4);
-            if (head[0] != 5 || head[1] != 1) {
-                stream.Write(new byte[] { 5, 7, 0, 1, 0, 0, 0, 0, 0, 0 }, 0, 10);
-                replied = true;
-                return;
-            }
+            try { stream.ReadTimeout = 20000; } catch { }
+            int first = stream.ReadByte();
+            if (first < 0) return;
             string host;
             int port;
-            if (head[3] == 1) {
-                byte[] ipb = ReadExact(stream, 4);
-                byte[] pb = ReadExact(stream, 2);
-                host = new IPAddress(ipb).ToString();
-                port = (pb[0] << 8) | pb[1];
-            } else if (head[3] == 3) {
-                int len = stream.ReadByte();
-                if (len < 1) throw new IOException("bos ad");
-                byte[] name = ReadExact(stream, len);
-                byte[] pb = ReadExact(stream, 2);
-                host = Encoding.ASCII.GetString(name);
-                port = (pb[0] << 8) | pb[1];
-            } else if (head[3] == 4) {
-                byte[] ipb = ReadExact(stream, 16);
-                byte[] pb = ReadExact(stream, 2);
-                host = new IPAddress(ipb).ToString();
-                port = (pb[0] << 8) | pb[1];
-            } else {
-                throw new IOException("adres tipi");
-            }
+            bool socks = first == 5;
+            bool okHead;
+            if (socks) okHead = ReadSocks(stream, out host, out port);
+            else okHead = ReadHttpConnect(stream, first, out host, out port);
+            if (!okHead) return;
             hostLabel = host + ":" + port;
 
             IPAddress ip = ResolveHost(host);
@@ -157,13 +153,16 @@ public class KopruEngine {
                 throw new IOException("zaman asimi");
             }
             remote.EndConnect(ar);
-            remote.ReceiveTimeout = -1;
-            remote.SendTimeout = -1;
+            Infinite(remote.Client);
+            Infinite(client.Client);
 
-            stream.Write(new byte[] { 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 }, 0, 10);
+            if (socks) {
+                stream.Write(new byte[] { 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 }, 0, 10);
+            } else {
+                byte[] ok = Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\n\r\n");
+                stream.Write(ok, 0, ok.Length);
+            }
             replied = true;
-            client.ReceiveTimeout = -1;
-            client.SendTimeout = -1;
             Pump(client, remote, stream, remote.GetStream(), port);
         } catch (Exception ex) {
             KopruLog.Write("hata " + hostLabel + " — " + ex.Message);
@@ -179,8 +178,78 @@ public class KopruEngine {
         }
     }
 
+    bool ReadSocks(NetworkStream stream, out string host, out int port) {
+        host = "?";
+        port = 0;
+        int nmet = stream.ReadByte();
+        if (nmet < 1) return false;
+        ReadExact(stream, nmet);
+        stream.Write(new byte[] { 5, 0 }, 0, 2);
+        byte[] head = ReadExact(stream, 4);
+        if (head[0] != 5 || head[1] != 1) {
+            stream.Write(new byte[] { 5, 7, 0, 1, 0, 0, 0, 0, 0, 0 }, 0, 10);
+            return false;
+        }
+        if (head[3] == 1) {
+            byte[] ipb = ReadExact(stream, 4);
+            byte[] pb = ReadExact(stream, 2);
+            host = new IPAddress(ipb).ToString();
+            port = (pb[0] << 8) | pb[1];
+        } else if (head[3] == 3) {
+            int len = stream.ReadByte();
+            if (len < 1) throw new IOException("bos ad");
+            byte[] name = ReadExact(stream, len);
+            byte[] pb = ReadExact(stream, 2);
+            host = Encoding.ASCII.GetString(name);
+            port = (pb[0] << 8) | pb[1];
+        } else if (head[3] == 4) {
+            byte[] ipb = ReadExact(stream, 16);
+            byte[] pb = ReadExact(stream, 2);
+            host = new IPAddress(ipb).ToString();
+            port = (pb[0] << 8) | pb[1];
+        } else {
+            throw new IOException("adres tipi");
+        }
+        return true;
+    }
+
+    bool ReadHttpConnect(NetworkStream stream, int first, out string host, out int port) {
+        host = "?";
+        port = 443;
+        MemoryStream ms = new MemoryStream();
+        ms.WriteByte((byte)first);
+        byte[] one = new byte[1];
+        while (ms.Length < 16000) {
+            int r = stream.Read(one, 0, 1);
+            if (r <= 0) return false;
+            ms.WriteByte(one[0]);
+            if (ms.Length >= 4) {
+                byte[] cur = ms.ToArray();
+                int n = cur.Length;
+                if (cur[n - 4] == 13 && cur[n - 3] == 10 && cur[n - 2] == 13 && cur[n - 1] == 10) break;
+            }
+        }
+        string text = Encoding.ASCII.GetString(ms.ToArray());
+        int lineEnd = text.IndexOf("\r\n");
+        if (lineEnd < 0) lineEnd = text.Length;
+        string line = text.Substring(0, lineEnd);
+        int sp1 = line.IndexOf(' ');
+        int sp2 = sp1 < 0 ? -1 : line.IndexOf(' ', sp1 + 1);
+        if (sp1 < 0 || sp2 < 0) return false;
+        string target = line.Substring(sp1 + 1, sp2 - sp1 - 1);
+        int colon = target.LastIndexOf(':');
+        if (colon > 0) {
+            host = target.Substring(0, colon);
+            int parsed;
+            if (int.TryParse(target.Substring(colon + 1), out parsed)) port = parsed;
+        } else {
+            host = target;
+        }
+        return host.Length > 0;
+    }
+
     void Pump(TcpClient client, TcpClient remote, NetworkStream fromClient, NetworkStream toServer, int port) {
-        byte[] hello = ReadAvailableHello(fromClient);
+        byte[] hello = ReadAvailableHello(fromClient, client.Client);
         if (hello != null && hello.Length > 0) {
             bool tls = hello[0] == 0x16 && port == 443 && SplitSni && hello.Length > 8;
             if (tls) {
@@ -222,8 +291,8 @@ public class KopruEngine {
         try { b.Close(); } catch { }
     }
 
-    static byte[] ReadAvailableHello(NetworkStream s) {
-        s.ReadTimeout = 8000;
+    static byte[] ReadAvailableHello(NetworkStream s, Socket sock) {
+        try { s.ReadTimeout = 8000; } catch { }
         MemoryStream ms = new MemoryStream();
         byte[] tmp = new byte[8192];
         try {
@@ -244,7 +313,7 @@ public class KopruEngine {
         } catch (Exception) {
             if (ms.Length == 0) throw;
         } finally {
-            s.ReadTimeout = -1;
+            Infinite(sock);
         }
         return ms.ToArray();
     }
@@ -327,6 +396,7 @@ public class KopruEngine {
     static string HttpGet(string url) {
         HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
         req.Timeout = 6000;
+        req.Proxy = new WebProxy();
         req.Accept = "application/dns-json";
         req.UserAgent = "Kopru/1.0";
         req.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
@@ -475,12 +545,31 @@ function Restore-KopruDns {
     & ipconfig /flushdns | Out-Null
 }
 
+function Stop-DiscordClients {
+    $roots = @(
+        (Join-Path $env:LOCALAPPDATA "Discord"),
+        (Join-Path $env:LOCALAPPDATA "DiscordPTB"),
+        (Join-Path $env:LOCALAPPDATA "DiscordCanary"),
+        (Join-Path $env:LOCALAPPDATA "DiscordDevelopment")
+    )
+    Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+        $path = $null
+        try { $path = $_.Path } catch { return }
+        if (-not $path) { return }
+        foreach ($root in $roots) {
+            if ($path.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+                try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch { }
+                break
+            }
+        }
+    }
+    Start-Sleep -Milliseconds 700
+}
+
 function Start-DiscordBridge([int]$port) {
-    $names = @("Discord", "DiscordPTB", "DiscordCanary", "DiscordDevelopment")
-    Get-Process -Name $names -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Milliseconds 800
-    $arg = "--proxy-server=socks5://127.0.0.1:{0}" -f $port
-    foreach ($n in $names) {
+    Stop-DiscordClients
+    $arg = "--proxy-server=http://127.0.0.1:{0}" -f $port
+    foreach ($n in @("Discord", "DiscordPTB", "DiscordCanary", "DiscordDevelopment")) {
         $upd = Join-Path $env:LOCALAPPDATA "$n\Update.exe"
         if (Test-Path $upd) {
             Start-Process -FilePath $upd -ArgumentList @("--processStart", "$n.exe", "--process-start-args", $arg)
@@ -488,6 +577,41 @@ function Start-DiscordBridge([int]$port) {
         }
     }
     return $null
+}
+
+function Enable-KopruWinProxy([int]$port) {
+    $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    if (-not $script:proxyBak) {
+        $en = 0
+        $srv = ""
+        $ov = ""
+        try { $en = [int](Get-ItemProperty -Path $key -Name ProxyEnable).ProxyEnable } catch { }
+        try { $srv = [string](Get-ItemProperty -Path $key -Name ProxyServer).ProxyServer } catch { }
+        try { $ov = [string](Get-ItemProperty -Path $key -Name ProxyOverride).ProxyOverride } catch { }
+        $script:proxyBak = @{ Enable = $en; Server = $srv; Override = $ov }
+    }
+    Set-ItemProperty -Path $key -Name ProxyEnable -Value 1
+    Set-ItemProperty -Path $key -Name ProxyServer -Value ("127.0.0.1:{0}" -f $port)
+    Set-ItemProperty -Path $key -Name ProxyOverride -Value "localhost;127.0.0.1;<local>"
+    [KopruEngine]::RefreshWinInet()
+    try { & netsh winhttp set proxy ("127.0.0.1:{0}" -f $port) 2>&1 | Out-Null } catch { Write-Ui "WinHTTP atlandı" }
+    Write-Ui ("Windows proxy 127.0.0.1:{0} — kapatınca geri alınır" -f $port)
+}
+
+function Disable-KopruWinProxy {
+    if (-not $script:proxyBak) { return }
+    $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    Set-ItemProperty -Path $key -Name ProxyEnable -Value ([int]$script:proxyBak.Enable)
+    if ($script:proxyBak.Server) {
+        Set-ItemProperty -Path $key -Name ProxyServer -Value ([string]$script:proxyBak.Server)
+    }
+    if ($script:proxyBak.Override) {
+        Set-ItemProperty -Path $key -Name ProxyOverride -Value ([string]$script:proxyBak.Override)
+    }
+    $script:proxyBak = $null
+    [KopruEngine]::RefreshWinInet()
+    try { & netsh winhttp reset proxy 2>&1 | Out-Null } catch { }
+    Write-Ui "Windows proxy geri alındı"
 }
 
 function Restart-AsAdmin {
@@ -506,7 +630,7 @@ $ink = [System.Drawing.Color]::FromArgb(12, 14, 10)
 
 $form = New-Object System.Windows.Forms.Form
 $script:form = $form
-$form.Text = "Köprü"
+$form.Text = "Köprü 1.2"
 $form.ClientSize = New-Object System.Drawing.Size(520, 640)
 $form.MinimumSize = New-Object System.Drawing.Size(520, 560)
 $form.StartPosition = "CenterScreen"
@@ -533,7 +657,7 @@ $form.Controls.Add($log)
 $form.Controls.Add($top)
 
 $title = New-Object System.Windows.Forms.Label
-$title.Text = "KÖPRÜ"
+$title.Text = "KÖPRÜ 1.2"
 $title.Font = New-Object System.Drawing.Font("Segoe UI", 18, [System.Drawing.FontStyle]::Bold)
 $title.ForeColor = $lime
 $title.Location = New-Object System.Drawing.Point(20, 14)
@@ -653,6 +777,7 @@ $btnOn.Add_Click({
         if (-not $started) { Write-Ui ("Port açılamadı: " + $err); return }
         $script:engine = $eng
         Write-Ui ("Profil " + $picked + ", parcalama " + $delay + " ms")
+        try { Enable-KopruWinProxy $eng.Port } catch { Write-Ui $_.Exception.Message }
         if ($script:chkDns.Checked) {
             try { Set-KopruDns } catch { Write-Ui $_.Exception.Message }
         }
@@ -697,6 +822,7 @@ $btnTest.Add_Click({
 $btnOff.Add_Click({
     if ($script:engine) { $script:engine.Stop(); $script:engine = $null }
     else { Write-Ui "Zaten kapalı" }
+    try { Disable-KopruWinProxy } catch { Write-Ui $_.Exception.Message }
 })
 
 $btnDnsBack.Add_Click({
@@ -727,8 +853,10 @@ $timer.Start()
 $form.Add_FormClosing({
     $timer.Stop()
     if ($script:engine) { $script:engine.Stop() }
+    try { Disable-KopruWinProxy } catch { }
 })
 
+Write-Ui "Sürüm 1.2. Pencerede 1.2 yazmıyorsa eski dosyayı çalıştırıyorsun."
 Write-Ui "Hazır. Köprüyü aç, sonra Dene."
 Write-Ui "Ses UDP'dir. Sohbet açılıp ses takılırsa operatörü değiştir."
 [void]$form.ShowDialog()
