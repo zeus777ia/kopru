@@ -1,0 +1,26 @@
+KÖPRÜ
+=====
+
+Windows programı. VPN değil. IP'ni gizlemez, şifrelemez.
+Discord'un kendi sunucusuna yine senin hattından gidersin.
+
+Ne yapar
+- İsimleri işletmecinin DNS'ine sormaz. Cloudflare / Google DoH kullanır.
+- İstersen Windows DNS'ini 1.1.1.1 yapar (yönetici ister, geri alınır).
+- 127.0.0.1 üzerinde yerel bir SOCKS5 açar.
+- Discord'u bu köprüyle başlatır.
+- Giden TLS selamını iki parçaya böler. Bazı hatlarda filtre site adını okuyamaz.
+
+Ne yapmaz
+- Ses (RTC) UDP'dir. Sohbet düzelip ses takılı kalabilir.
+- Her işletmecide işe yaramaz. Olmazsa uygulamada operatörü değiştir, "Discord'u dene"ye bas.
+- Derin filtre + ses için obfuscation'lı bir VPN hâlâ gerekebilir.
+
+Kurulum
+1. Bu klasörün tamamını PC'ye çıkar.
+2. Baslat.bat dosyasına çift tıkla.
+3. DNS kutusunu işaretlediysen "Yönetici olarak yeniden aç".
+4. Köprüyü aç. Discord kapanıp köprüyle geri gelir.
+
+Kapatınca
+Durdur'a bas. DNS'i değiştirdiysen "DNS'i geri al".
